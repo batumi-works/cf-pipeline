@@ -1,0 +1,266 @@
+name: "Reusable Deploy Workflow"
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: 'Deployment environment'
+        type: string
+        required: true
+      node_version:
+        description: 'Node.js version to use'
+        type: string
+        default: '18'
+      wrangler_version:
+        description: 'Wrangler version to use'
+        type: string
+        default: 'latest'
+      dry_run:
+        description: 'Perform a dry run deployment'
+        type: boolean
+        default: false
+      enable_rollback:
+        description: 'Enable rollback capability'
+        type: boolean
+        default: true
+    secrets:
+      CLOUDFLARE_API_TOKEN:
+        description: 'Cloudflare API token'
+        required: true
+      DATADOG_API_KEY:
+        description: 'Datadog API key for observability'
+        required: false
+      DATADOG_APP_KEY:
+        description: 'Datadog application key'
+        required: false
+
+permissions:
+  contents: read
+  deployments: write
+  id-token: write
+
+jobs:
+  pre-deploy:
+    runs-on: ubuntu-latest
+    outputs:
+      deployment-id: ${{ steps.deployment.outputs.deployment_id }}
+      cache-key: ${{ steps.cache-key.outputs.key }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Generate cache key
+        id: cache-key
+        run: |
+          echo "key=deploy-${{ inputs.node_version }}-${{ hashFiles('package-lock.json', 'wrangler.toml') }}" >> $GITHUB_OUTPUT
+
+      - name: Create deployment
+        id: deployment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { data: deployment } = await github.rest.repos.createDeployment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              ref: context.sha,
+              environment: '${{ inputs.environment }}',
+              auto_merge: false,
+              required_contexts: []
+            });
+            
+            await github.rest.repos.createDeploymentStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              deployment_id: deployment.id,
+              state: 'in_progress',
+              description: 'Deployment started'
+            });
+            
+            return deployment.id;
+
+      - name: Setup Worker Environment
+        uses: ./.github/actions/setup-worker
+        with:
+          node-version: ${{ inputs.node_version }}
+          wrangler-version: ${{ inputs.wrangler_version }}
+          cache-key: ${{ steps.cache-key.outputs.cache-key }}
+
+      - name: Pre-deployment validation
+        run: |
+          # Validate wrangler.toml for environment
+          if ! npx wrangler whoami; then
+            echo "❌ Wrangler authentication failed"
+            exit 1
+          fi
+          
+          # Check environment configuration
+          if ! grep -q "\\[env\\.${{ inputs.environment }}\\]" wrangler.toml; then
+            echo "⚠️  Environment ${{ inputs.environment }} not found in wrangler.toml"
+          fi
+          
+          echo "✅ Pre-deployment validation passed"
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+
+  deploy:
+    runs-on: ubuntu-latest
+    needs: pre-deploy
+    environment: ${{ inputs.environment }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Worker Environment
+        uses: ./.github/actions/setup-worker
+        with:
+          node-version: ${{ inputs.node_version }}
+          wrangler-version: ${{ inputs.wrangler_version }}
+          cache-key: ${{ needs.pre-deploy.outputs.cache-key }}
+
+      - name: Build for deployment
+        run: |
+          if npm run build --if-present; then
+            echo "✅ Build completed"
+          else
+            echo "⚠️  No build script found, using source directly"
+          fi
+
+      - name: Deploy to Cloudflare Workers
+        id: deploy
+        run: |
+          DEPLOY_CMD="npx wrangler deploy"
+          
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            DEPLOY_CMD="$DEPLOY_CMD --dry-run"
+            echo "🔍 Performing dry run deployment"
+          fi
+          
+          if [ "${{ inputs.environment }}" != "production" ]; then
+            DEPLOY_CMD="$DEPLOY_CMD --env ${{ inputs.environment }}"
+          fi
+          
+          echo "Executing: $DEPLOY_CMD"
+          $DEPLOY_CMD
+          
+          # Get deployment URL
+          WORKER_URL=$(npx wrangler deploy --dry-run --env ${{ inputs.environment }} 2>&1 | grep -o 'https://[^[:space:]]*' | head -1 || echo "")
+          echo "deployment-url=${WORKER_URL}" >> $GITHUB_OUTPUT
+          
+          echo "✅ Deployment completed"
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+
+      - name: Test deployment
+        if: ${{ !inputs.dry_run }}
+        run: |
+          DEPLOYMENT_URL="${{ steps.deploy.outputs.deployment-url }}"
+          
+          if [ -n "$DEPLOYMENT_URL" ]; then
+            echo "Testing deployment at: $DEPLOYMENT_URL"
+            
+            # Wait for deployment to propagate
+            sleep 30
+            
+            # Test deployment
+            if curl -f "$DEPLOYMENT_URL" > /dev/null 2>&1; then
+              echo "✅ Deployment test passed"
+            else
+              echo "❌ Deployment test failed"
+              exit 1
+            fi
+          else
+            echo "⚠️  No deployment URL found, skipping test"
+          fi
+
+      - name: Store deployment metadata
+        if: ${{ inputs.enable_rollback && !inputs.dry_run }}
+        run: |
+          DEPLOYMENT_DATA=$(cat << EOF
+          {
+            "service": "$(jq -r '.name' package.json)",
+            "version": "$(jq -r '.version' package.json)",
+            "environment": "${{ inputs.environment }}",
+            "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "commit_sha": "${{ github.sha }}",
+            "deployment_id": "${{ needs.pre-deploy.outputs.deployment-id }}",
+            "deployment_url": "${{ steps.deploy.outputs.deployment-url }}",
+            "workflow_run_id": "${{ github.run_id }}"
+          }
+          EOF
+          )
+          
+          echo "$DEPLOYMENT_DATA" > deployment-metadata.json
+          
+          # Store in artifacts for rollback capability
+          echo "📦 Storing deployment metadata"
+
+      - name: Upload deployment artifacts
+        if: ${{ inputs.enable_rollback && !inputs.dry_run }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: deployment-metadata-${{ inputs.environment }}-${{ github.run_id }}
+          path: deployment-metadata.json
+          retention-days: 30
+
+  post-deploy:
+    runs-on: ubuntu-latest
+    needs: [pre-deploy, deploy]
+    if: always()
+    steps:
+      - name: Update deployment status
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const status = '${{ needs.deploy.result }}' === 'success' ? 'success' : 'failure';
+            const description = status === 'success' ? 'Deployment completed successfully' : 'Deployment failed';
+            
+            await github.rest.repos.createDeploymentStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              deployment_id: ${{ needs.pre-deploy.outputs.deployment-id }},
+              state: status,
+              description: description,
+              environment_url: '${{ needs.deploy.outputs.deployment-url }}'
+            });
+
+      - name: Send Datadog deployment event
+        if: ${{ secrets.DATADOG_API_KEY && !inputs.dry_run }}
+        run: |
+          STATUS="${{ needs.deploy.result == 'success' && 'success' || 'failure' }}"
+          
+          curl -X POST "https://api.datadoghq.com/api/v1/events" \
+            -H "Content-Type: application/json" \
+            -H "DD-API-KEY: ${{ secrets.DATADOG_API_KEY }}" \
+            -H "DD-APPLICATION-KEY: ${{ secrets.DATADOG_APP_KEY }}" \
+            -d "{
+              \"title\": \"Deployment $STATUS: ${{ inputs.environment }}\",
+              \"text\": \"Deployment to ${{ inputs.environment }} completed with status: $STATUS\",
+              \"tags\": [
+                \"source:github-actions\",
+                \"env:${{ inputs.environment }}\",
+                \"repo:${{ github.repository }}\",
+                \"status:$STATUS\",
+                \"deployment:cloudflare-workers\"
+              ],
+              \"source_type_name\": \"github\",
+              \"alert_type\": \"${{ needs.deploy.result == 'success' && 'info' || 'error' }}\"
+            }"
+        continue-on-error: true
+
+      - name: Report deployment results
+        run: |
+          echo "## Deployment Results"
+          echo "- Environment: ${{ inputs.environment }}"
+          echo "- Status: ${{ needs.deploy.result }}"
+          echo "- Dry Run: ${{ inputs.dry_run }}"
+          echo "- Deployment ID: ${{ needs.pre-deploy.outputs.deployment-id }}"
+          echo "- Commit SHA: ${{ github.sha }}"
+          echo "- Workflow Run: ${{ github.run_id }}"
+          
+          if [ "${{ needs.deploy.result }}" = "success" ] && [ "${{ inputs.dry_run }}" = "false" ]; then
+            echo "🎉 Deployment completed successfully!"
+          elif [ "${{ inputs.dry_run }}" = "true" ]; then
+            echo "✅ Dry run completed successfully!"
+          else
+            echo "❌ Deployment failed!"
+          fi

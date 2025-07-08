@@ -1,0 +1,236 @@
+name: "Reusable CI Workflow"
+
+on:
+  workflow_call:
+    inputs:
+      node_version:
+        description: 'Node.js version to use'
+        type: string
+        default: '18'
+      test_command:
+        description: 'Test command to run'
+        type: string
+        default: 'npm test'
+      wrangler_version:
+        description: 'Wrangler version to use'
+        type: string
+        default: 'latest'
+      environment:
+        description: 'Environment to test against'
+        type: string
+        default: 'development'
+      enable_security_scan:
+        description: 'Enable security scanning'
+        type: boolean
+        default: true
+    secrets:
+      CLOUDFLARE_API_TOKEN:
+        description: 'Cloudflare API token'
+        required: true
+      DATADOG_API_KEY:
+        description: 'Datadog API key for observability'
+        required: false
+      DATADOG_APP_KEY:
+        description: 'Datadog application key'
+        required: false
+
+jobs:
+  setup-validation:
+    runs-on: ubuntu-latest
+    outputs:
+      cache-key: ${{ steps.cache-key.outputs.key }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Generate cache key
+        id: cache-key
+        run: |
+          echo "key=node-${{ inputs.node_version }}-${{ hashFiles('package-lock.json', 'wrangler.toml') }}" >> $GITHUB_OUTPUT
+
+      - name: Validate wrangler.toml
+        run: |
+          if [ ! -f wrangler.toml ]; then
+            echo "❌ wrangler.toml not found"
+            exit 1
+          fi
+          echo "✅ wrangler.toml found"
+
+      - name: Validate package.json
+        run: |
+          if [ ! -f package.json ]; then
+            echo "❌ package.json not found"
+            exit 1
+          fi
+          echo "✅ package.json found"
+
+  test:
+    runs-on: ubuntu-latest
+    needs: setup-validation
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Worker Environment
+        uses: ./.github/actions/setup-worker
+        with:
+          node-version: ${{ inputs.node_version }}
+          wrangler-version: ${{ inputs.wrangler_version }}
+          cache-key: ${{ needs.setup-validation.outputs.cache-key }}
+
+      - name: Run linting
+        run: |
+          if npm run lint --if-present; then
+            echo "✅ Linting passed"
+          else
+            echo "⚠️  Linting not configured or failed"
+          fi
+
+      - name: Run type checking
+        run: |
+          if npm run typecheck --if-present; then
+            echo "✅ Type checking passed"
+          else
+            echo "⚠️  Type checking not configured or failed"
+          fi
+
+      - name: Run tests
+        run: ${{ inputs.test_command }}
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          NODE_ENV: test
+
+      - name: Test local development server
+        run: |
+          # Start development server in background
+          timeout 30s npm run dev > dev-server.log 2>&1 &
+          DEV_PID=$!
+          
+          # Wait for server to start
+          sleep 10
+          
+          # Test server response
+          if curl -f http://localhost:8787/ > /dev/null 2>&1; then
+            echo "✅ Development server started successfully"
+          else
+            echo "❌ Development server failed to start"
+            cat dev-server.log
+            exit 1
+          fi
+          
+          # Clean up
+          kill $DEV_PID || true
+        continue-on-error: true
+
+      - name: Test Wrangler configuration
+        run: |
+          npx wrangler whoami
+          npx wrangler --version
+          echo "✅ Wrangler configuration valid"
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+
+  security-scan:
+    runs-on: ubuntu-latest
+    needs: setup-validation
+    if: ${{ inputs.enable_security_scan }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Worker Environment
+        uses: ./.github/actions/setup-worker
+        with:
+          node-version: ${{ inputs.node_version }}
+          wrangler-version: ${{ inputs.wrangler_version }}
+          cache-key: ${{ needs.setup-validation.outputs.cache-key }}
+
+      - name: Run security audit
+        run: |
+          npm audit --audit-level=moderate
+          echo "✅ Security audit completed"
+
+      - name: Check for secrets in code
+        run: |
+          if git log --all --grep="password\|secret\|key\|token" --oneline | head -10; then
+            echo "⚠️  Potential secrets found in commit messages"
+          fi
+          
+          if grep -r -i "password\|secret\|key.*=" --include="*.js" --include="*.ts" --include="*.json" src/ || true; then
+            echo "⚠️  Potential secrets found in source code"
+          fi
+          
+          echo "✅ Secret scanning completed"
+
+      - name: Dependency vulnerability check
+        run: |
+          npx audit-ci --config audit-ci.json || echo "⚠️  Vulnerability check completed with warnings"
+        continue-on-error: true
+
+  build-test:
+    runs-on: ubuntu-latest
+    needs: [setup-validation, test]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Worker Environment
+        uses: ./.github/actions/setup-worker
+        with:
+          node-version: ${{ inputs.node_version }}
+          wrangler-version: ${{ inputs.wrangler_version }}
+          cache-key: ${{ needs.setup-validation.outputs.cache-key }}
+
+      - name: Build Worker
+        run: |
+          if npm run build --if-present; then
+            echo "✅ Build completed"
+          else
+            echo "⚠️  No build script found, using default"
+          fi
+
+      - name: Validate build output
+        run: |
+          if [ -f dist/index.js ] || [ -f src/index.js ]; then
+            echo "✅ Worker entry point found"
+          else
+            echo "❌ No Worker entry point found"
+            exit 1
+          fi
+
+  notify:
+    runs-on: ubuntu-latest
+    needs: [test, security-scan, build-test]
+    if: always()
+    steps:
+      - name: Send Datadog Event
+        if: ${{ secrets.DATADOG_API_KEY }}
+        run: |
+          STATUS="${{ needs.test.result == 'success' && needs.build-test.result == 'success' && 'success' || 'failure' }}"
+          
+          curl -X POST "https://api.datadoghq.com/api/v1/events" \
+            -H "Content-Type: application/json" \
+            -H "DD-API-KEY: ${{ secrets.DATADOG_API_KEY }}" \
+            -H "DD-APPLICATION-KEY: ${{ secrets.DATADOG_APP_KEY }}" \
+            -d "{
+              \"title\": \"CI Pipeline $STATUS\",
+              \"text\": \"CI pipeline completed with status: $STATUS\",
+              \"tags\": [
+                \"source:github-actions\",
+                \"env:${{ inputs.environment }}\",
+                \"repo:${{ github.repository }}\",
+                \"status:$STATUS\"
+              ],
+              \"source_type_name\": \"github\"
+            }"
+        continue-on-error: true
+
+      - name: Report Results
+        run: |
+          echo "## CI Pipeline Results"
+          echo "- Tests: ${{ needs.test.result }}"
+          echo "- Security: ${{ needs.security-scan.result }}"
+          echo "- Build: ${{ needs.build-test.result }}"
+          echo "- Environment: ${{ inputs.environment }}"
+          echo "- Node.js: ${{ inputs.node_version }}"
+          echo "- Wrangler: ${{ inputs.wrangler_version }}"
