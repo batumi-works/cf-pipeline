@@ -71,12 +71,39 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Setup Worker Environment
-        uses: ./.github/actions/setup-worker
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
         with:
           node-version: ${{ inputs.node_version }}
-          wrangler-version: ${{ inputs.wrangler_version }}
-          cache-key: ${{ needs.setup-validation.outputs.cache-key }}
+          registry-url: 'https://registry.npmjs.org'
+          cache: 'npm'
+          cache-dependency-path: 'package-lock.json'
+
+      - name: Cache npm dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.npm
+            node_modules
+          key: ${{ needs.setup-validation.outputs.cache-key }}
+          restore-keys: |
+            node-${{ inputs.node_version }}-
+
+      - name: Install dependencies
+        run: |
+          echo "📦 Installing npm dependencies..."
+          npm ci --prefer-offline --no-audit
+          echo "✅ Dependencies installed"
+
+      - name: Setup Wrangler CLI
+        run: |
+          echo "🔧 Setting up Wrangler CLI..."
+          if [ "${{ inputs.wrangler_version }}" = "latest" ]; then
+            npm install -g wrangler
+          else
+            npm install -g wrangler@${{ inputs.wrangler_version }}
+          fi
+          echo "✅ Wrangler CLI installed"
 
       - name: Run linting
         run: |
@@ -138,12 +165,39 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Setup Worker Environment
-        uses: ./.github/actions/setup-worker
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
         with:
           node-version: ${{ inputs.node_version }}
-          wrangler-version: ${{ inputs.wrangler_version }}
-          cache-key: ${{ needs.setup-validation.outputs.cache-key }}
+          registry-url: 'https://registry.npmjs.org'
+          cache: 'npm'
+          cache-dependency-path: 'package-lock.json'
+
+      - name: Cache npm dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.npm
+            node_modules
+          key: ${{ needs.setup-validation.outputs.cache-key }}
+          restore-keys: |
+            node-${{ inputs.node_version }}-
+
+      - name: Install dependencies
+        run: |
+          echo "📦 Installing npm dependencies..."
+          npm ci --prefer-offline --no-audit
+          echo "✅ Dependencies installed"
+
+      - name: Setup Wrangler CLI
+        run: |
+          echo "🔧 Setting up Wrangler CLI..."
+          if [ "${{ inputs.wrangler_version }}" = "latest" ]; then
+            npm install -g wrangler
+          else
+            npm install -g wrangler@${{ inputs.wrangler_version }}
+          fi
+          echo "✅ Wrangler CLI installed"
 
       - name: Run security audit
         run: |
@@ -174,12 +228,39 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Setup Worker Environment
-        uses: ./.github/actions/setup-worker
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
         with:
           node-version: ${{ inputs.node_version }}
-          wrangler-version: ${{ inputs.wrangler_version }}
-          cache-key: ${{ needs.setup-validation.outputs.cache-key }}
+          registry-url: 'https://registry.npmjs.org'
+          cache: 'npm'
+          cache-dependency-path: 'package-lock.json'
+
+      - name: Cache npm dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.npm
+            node_modules
+          key: ${{ needs.setup-validation.outputs.cache-key }}
+          restore-keys: |
+            node-${{ inputs.node_version }}-
+
+      - name: Install dependencies
+        run: |
+          echo "📦 Installing npm dependencies..."
+          npm ci --prefer-offline --no-audit
+          echo "✅ Dependencies installed"
+
+      - name: Setup Wrangler CLI
+        run: |
+          echo "🔧 Setting up Wrangler CLI..."
+          if [ "${{ inputs.wrangler_version }}" = "latest" ]; then
+            npm install -g wrangler
+          else
+            npm install -g wrangler@${{ inputs.wrangler_version }}
+          fi
+          echo "✅ Wrangler CLI installed"
 
       - name: Build Worker
         run: |
